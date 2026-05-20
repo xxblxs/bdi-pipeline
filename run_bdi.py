@@ -1,27 +1,20 @@
 #!/usr/bin/env python3
 """
-run_bdi.py — Aquabridge BDI 一键抓取 + 解析 + 入库 (nora@reachyint.com 源)
-
-主线分支使用 nora@reachyint.com 转发的 Baltic Exchange 官方 PDF 包，
-一封邮件包含全部 6~7 份 PDF（Baltic Dry/Capesize/Panamax/Supramax/Handysize Index
-+ Dry TC Averages + Fixtures Report），主题如:
-    "FW: Baltic Index Reports& Fixture Report 23.4.2026"
-
-如果 nora 中断且短期内不恢复，切到 brs-source 分支即可使用 BRS Brokers 源。
+run_bdi.py — Aquabridge BDI 一键抓取 + 解析 + 入库
 
 每天运行一次:
-    python3 run_bdi.py                                # 抓最近 7 天
+    python3 run_bdi.py                                # 抓最近 7 天的 BRS 邮件
     python3 run_bdi.py --days 14                      # 回溯 14 天
-    python3 run_bdi.py --date 2026-04-23              # 只处理指定日期
-    python3 run_bdi.py --date 2026-04-23 --force      # 即使 CSV 已有也覆盖
+    python3 run_bdi.py --date 2026-05-05              # 只处理指定那天
+    python3 run_bdi.py --start 2026-05-01 --end 2026-05-10  # 处理日期区间
 
 输出:
-    1) 解析后的 JSON → ./output/json/bdi_YYYY-MM-DD.json
+    1) 解析后的 JSON 文件 → ./output/json/bdi_YYYY-MM-DD.json
     2) 附件备份 → ./output/attachments/YYYY-MM-DD/
-    3) Append/覆盖一行到 ./baltic_exchange_index_history.csv
+    3) Append 一行到 ./baltic_exchange_index_history.csv
 
 依赖:
-    .venv/bin/pip install pdfplumber certifi
+    pip3 install pdfplumber
 """
 import argparse
 import csv
@@ -30,35 +23,36 @@ import imaplib
 import json
 import re
 import ssl
-import tempfile
-import zipfile
 from datetime import datetime, timedelta
 from email.header import decode_header
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# 配置
+# 配置（修改这里即可）
 # ---------------------------------------------------------------------------
 IMAP_HOST = "imap.qiye.aliyun.com"
 IMAP_PORT = 993
 IMAP_USER = "data@aquabridge.ai"
-IMAP_PWD  = "bZ4NqiA4k8WK6iIb"
+IMAP_PWD  = "bZ4NqiA4k8WK6iIb"          # 三方客户端专用密码
 
-# 监听的发件人（含 Reach Shipping 转发链路上的所有可能 From）
+# 监听的发件人（BRS Brokers 同时使用 zhu.hao-sheng.p@ 和 research.asia@ 等多个邮箱，
+# 用域名做子串匹配可一次涵盖）
 TARGET_SENDERS = [
-    "nora@reachyint.com",
-    "reachyint.com",
+    "brsbrokers.com",
 ]
 
-# 邮件主题正则 — 兼容历史的 "Baltic Index Reports& Fixture Report 23.4.2026" 等格式
-SUBJECT_RE = re.compile(r"Baltic\s+Index\s+Reports.*Fixture\s+Report", re.IGNORECASE)
+# 不再用 SUBJECT_RE 过滤 —— BRS 一天会发 5~10 封不同主题的邮件，
+# 需要把同一天所有 PDF 攒到一个文件夹，再交给 parse_day() 解析。
 
+# 输出目录（脚本所在目录）
 HERE = Path(__file__).resolve().parent
 OUTPUT_DIR  = HERE / "output"
 JSON_DIR    = OUTPUT_DIR / "json"
 ATTACH_DIR  = OUTPUT_DIR / "attachments"
 CSV_PATH    = HERE / "baltic_exchange_index_history.csv"
 
+# CSV 列顺序（与你现有 csv 完全一致；不可解析的字段留空）
 CSV_COLUMNS = [
     "_id","date","BCI","BDI","BHSI","BPI","BSI",
     "C10_182","C14_182","C16_182","C17","C17-TCE","C2","C2-TCE","C3","C3-TCE",
@@ -81,8 +75,9 @@ CSV_COLUMNS = [
 # ---------------------------------------------------------------------------
 def decode_str(s):
     if s is None: return ""
+    parts = decode_header(s)
     out = []
-    for text, enc in decode_header(s):
+    for text, enc in parts:
         if isinstance(text, bytes):
             try:
                 out.append(text.decode(enc or "utf-8", errors="replace"))
@@ -95,44 +90,53 @@ def decode_str(s):
 
 def login():
     print(f"  ↪ Login {IMAP_USER}@{IMAP_HOST}:{IMAP_PORT}")
-    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ctx = ssl.create_default_context()
     M = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ctx)
     M.login(IMAP_USER, IMAP_PWD)
     M.select("INBOX", readonly=True)
     return M
 
 
-def fetch_bdi_mails(M, since_days=7):
-    """Find nora@reachyint.com BDI report mails in the last N days.
+def fetch_brs_mails_by_day(M, start_date: datetime, end_date: datetime):
+    """Group BRS mails by their email-Date UTC day.
 
-    Aliyun IMAP 不支持 FROM 子串搜索：服务器只用 SINCE 过滤，发件人在客户端筛。
+    Aliyun IMAP 不支持 FROM 子串搜索：服务器只用 SINCE/BEFORE 过滤，
+    发件人在客户端筛。返回 dict: 'YYYY-MM-DD' -> [(mid, fr, subj), ...]
     """
-    since = (datetime.now() - timedelta(days=since_days)).strftime("%d-%b-%Y")
-    typ, ids = M.search(None, "SINCE", since)
+    since = start_date.strftime("%d-%b-%Y")
+    before = (end_date + timedelta(days=1)).strftime("%d-%b-%Y")
+    typ, ids = M.search(None, "SINCE", since, "BEFORE", before)
     if typ != "OK" or not ids or not ids[0]:
-        return []
+        return {}
     senders_lc = [s.lower() for s in TARGET_SENDERS]
-    found = []
-    seen = set()
+    by_day = {}
     for mid in ids[0].split():
         typ, data = M.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT DATE FROM)])")
-        raw = data[0][1] if data and data[0] else b""
+        if typ != "OK" or not data or not data[0]:
+            continue
+        raw = data[0][1] if isinstance(data[0], tuple) else b""
         msg = email.message_from_bytes(raw)
         fr = (decode_str(msg.get("From")) or "").lower()
         if not any(s in fr for s in senders_lc):
             continue
         subj = decode_str(msg.get("Subject")) or ""
-        if not SUBJECT_RE.search(subj):
+        try:
+            dt = parsedate_to_datetime(msg.get("Date") or "")
+        except Exception:
+            dt = None
+        if dt is None:
             continue
-        if mid in seen:
-            continue
-        seen.add(mid)
-        found.append((mid, subj))
-    return found
+        day = dt.astimezone().strftime("%Y-%m-%d")
+        by_day.setdefault(day, []).append((mid, fr, subj))
+    return by_day
 
 
 def download_attachments(M, mid, dest_dir: Path):
-    """Download PDF/zip attachments of a mail to dest_dir."""
+    """Download PDF/zip attachments. Dedupes filename collisions across mails."""
     typ, data = M.fetch(mid, "(RFC822)")
     if typ != "OK": return []
     msg = email.message_from_bytes(data[0][1])
@@ -145,8 +149,14 @@ def download_attachments(M, mid, dest_dir: Path):
         if not (fname.lower().endswith(".pdf") or fname.lower().endswith(".zip")):
             continue
         target = dest_dir / fname
+        i = 1
+        while target.exists():
+            stem, ext = Path(fname).stem, Path(fname).suffix
+            target = dest_dir / f"{stem}__{i}{ext}"
+            i += 1
         payload = part.get_payload(decode=True)
-        if not payload: continue
+        if not payload:
+            continue
         with open(target, "wb") as f:
             f.write(payload)
         saved.append(target)
@@ -163,11 +173,12 @@ def ensure_csv():
 
 
 def append_row(parsed: dict):
+    """Append parsed dict as one CSV row, in CSV_COLUMNS order."""
     ensure_csv()
     row = []
     for col in CSV_COLUMNS:
         if col == "_id":
-            row.append("")
+            row.append("")  # 留给后端生成
         elif col == "updated_at":
             row.append(parsed.get("updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         else:
@@ -178,27 +189,17 @@ def append_row(parsed: dict):
 
 
 def existing_csv_dates() -> set:
+    """Return the set of date strings already present in the CSV's `date` column."""
     if not CSV_PATH.exists():
         return set()
     out = set()
     with open(CSV_PATH, encoding="utf-8", newline="") as f:
-        for row in csv.DictReader(f):
-            d = (row.get("date") or "").strip()
-            if d: out.add(d)
-    return out
-
-
-def remove_date_row(date_str: str):
-    if not CSV_PATH.exists():
-        return
-    with open(CSV_PATH, encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
-        rows = [r for r in reader if r.get("date") != date_str]
-        fields = reader.fieldnames
-    with open(CSV_PATH, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        w.writerows(rows)
+        for row in reader:
+            d = (row.get("date") or "").strip()
+            if d:
+                out.add(d)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -208,79 +209,133 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days",  type=int, default=7,  help="回溯天数 (default 7)")
     ap.add_argument("--date",  type=str, default=None, help="只处理指定日期 YYYY-MM-DD")
-    ap.add_argument("--force", action="store_true",   help="即使 CSV 已有该日期也重新写入（先删除旧行）")
+    ap.add_argument("--start", type=str, default=None, help="区间起始 YYYY-MM-DD")
+    ap.add_argument("--end",   type=str, default=None, help="区间结束 YYYY-MM-DD")
+    ap.add_argument("--force", action="store_true",   help="即使 CSV 已有该日期也重新写入")
     args = ap.parse_args()
+
+    # 计算时间区间
+    if args.date:
+        start = end = datetime.strptime(args.date, "%Y-%m-%d")
+    elif args.start or args.end:
+        if not (args.start and args.end):
+            ap.error("--start 与 --end 必须同时给出")
+        start = datetime.strptime(args.start, "%Y-%m-%d")
+        end = datetime.strptime(args.end, "%Y-%m-%d")
+    else:
+        end = datetime.now()
+        start = end - timedelta(days=args.days)
+    if end < start:
+        ap.error("--end 不能早于 --start")
 
     JSON_DIR.mkdir(parents=True, exist_ok=True)
     ATTACH_DIR.mkdir(parents=True, exist_ok=True)
     from parse_bdi import parse_day
 
-    print("[1/3] 连接邮箱并搜索 nora@reachyint.com BDI 报告邮件 …")
+    # 把搜索窗口往后扩 5 天，方便给最后一天的 BDI/BPI/... 找到「下一日 BRS Daily」
+    fetch_end = end + timedelta(days=5)
+    print(f"[1/3] 连接邮箱并按天分组 BRS 邮件（{start:%Y-%m-%d} → {fetch_end:%Y-%m-%d}） …")
     M = login()
-    mails = fetch_bdi_mails(M, since_days=args.days)
-    print(f"      找到 {len(mails)} 封匹配邮件")
-    for mid, subj in mails:
-        print(f"        [{mid.decode()}] {subj}")
+    by_day = fetch_brs_mails_by_day(M, start, fetch_end)
+    print(f"      命中 {sum(len(v) for v in by_day.values())} 封邮件，跨 {len(by_day)} 个日期")
 
-    print(f"\n[2/3] 下载附件并解析 …")
-    existing = existing_csv_dates()
-    success_dates = []
-    written_this_run = set()
-    for mid, subj in mails:
-        m = re.search(r"(\d{1,2})[\.\-/](\d{1,2})[\.\-/](\d{4})", subj)
-        date_hint = None
-        if m:
-            d, mo, y = m.groups()
-            date_hint = f"{y}-{int(mo):02d}-{int(d):02d}"
-            if args.date and args.date != date_hint:
-                continue
-            if not args.force and date_hint in existing:
-                print(f"      [SKIP] {date_hint} 已在 CSV，跳过（--force 强制重写）")
-                continue
-            if date_hint in written_this_run:
-                print(f"      [SKIP] {date_hint} 本次已写入（重复邮件）")
-                continue
-
-        with tempfile.TemporaryDirectory(prefix="bdi_mail_") as tmp:
-            files = download_attachments(M, mid, Path(tmp))
-            if not files:
-                print(f"      [WARN] 邮件 {subj!r} 无 PDF/zip 附件")
-                continue
-            work = Path(tmp)
-            for fp in files:
-                if fp.suffix.lower() == ".zip":
-                    with zipfile.ZipFile(fp) as z:
-                        z.extractall(work)
-            try:
-                parsed = parse_day(str(work))
-            except Exception as e:
-                print(f"      [ERR] 解析失败: {e}")
-                continue
-
-            date_str = parsed.get("date") or date_hint or datetime.now().strftime("%Y-%m-%d")
-            parsed["date"] = date_str
-
-            json_path = JSON_DIR / f"bdi_{date_str}.json"
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(parsed, f, indent=2, ensure_ascii=False)
-            day_attach = ATTACH_DIR / date_str
-            day_attach.mkdir(exist_ok=True)
-            for p in work.rglob("*.pdf"):
-                (day_attach / p.name).write_bytes(p.read_bytes())
-
-            if date_str in existing or date_str in written_this_run:
-                remove_date_row(date_str)
-            append_row(parsed)
-            written_this_run.add(date_str)
-            success_dates.append(date_str)
-            print(f"      [OK]  {date_str}  BDI={parsed.get('BDI')}  BCI={parsed.get('BCI')}  "
-                  f"BPI={parsed.get('BPI')}  BSI={parsed.get('BSI')}  BHSI={parsed.get('BHSI')}")
-
+    print(f"\n[2/3] 下载附件 …")
+    for day in sorted(by_day):
+        mails = by_day[day]
+        day_attach = ATTACH_DIR / day
+        day_attach.mkdir(exist_ok=True)
+        print(f"  ── {day}（{len(mails)} 封）──")
+        for mid, fr, subj in mails:
+            saved = download_attachments(M, mid, day_attach)
+            print(f"    [{mid.decode()}] {fr}  |  {subj}  ({len(saved)} attach)")
     M.logout()
 
-    print(f"\n[3/3] 完成。共写入 {len(success_dates)} 天:")
+    # 建索引：每一天文件夹里有没有 dedicated Capesize Index / BRS Daily Report
+    def find_one(folder: Path, pattern: str):
+        for p in sorted(folder.glob(pattern)):
+            return p
+        return None
+
+    capesize_by_day = {}   # day -> Capesize Index PDF (= 该日为交易日)
+    brs_daily_by_day = {}  # day -> BRS Daily Report PDF
+    for day_folder in sorted(ATTACH_DIR.iterdir()):
+        if not day_folder.is_dir(): continue
+        day = day_folder.name
+        cap = find_one(day_folder, "Baltic Capesize Index*.pdf")
+        if cap: capesize_by_day[day] = cap
+        brs = find_one(day_folder, "BRS DAILY REPORT*.pdf")
+        if brs: brs_daily_by_day[day] = brs
+
+    # 仅处理「请求区间 ∩ 交易日」(= 有 dedicated Capesize Index PDF 的日期)
+    target_dates = []
+    cur = start
+    while cur <= end:
+        d = cur.strftime("%Y-%m-%d")
+        if d in capesize_by_day:
+            target_dates.append(d)
+        cur += timedelta(days=1)
+
+    sorted_brs_days = sorted(brs_daily_by_day.keys())
+    all_trading_days = sorted(capesize_by_day.keys())  # 所有已下载到 Capesize PDF 的日子
+    existing = set() if args.force else existing_csv_dates()
+
+    print(f"\n[3/3] 解析 {len(target_dates)} 个交易日并写入 …")
+    success_dates = []
+    skipped = []
+    for date_str in target_dates:
+        day_folder = ATTACH_DIR / date_str
+        # 找下一个 BRS Daily（一般来说次个交易日的 Issue 才包含本日 close）
+        next_brs_day = next((d for d in sorted_brs_days if d > date_str), None)
+        next_brs = brs_daily_by_day[next_brs_day] if next_brs_day else None
+        if next_brs is None:
+            print(f"  [WARN] {date_str} 下一日 BRS Daily 暂未到达 —— BDI/BPI/BSI/BHSI 将留空")
+
+        # 如果 date_str 与 next_brs_day 之间夹了一个交易日，
+        # 则 BRS Daily 报告的是「夹在中间那个交易日」的收盘，需用 SPOT-CHANGE 回算
+        back_calc = False
+        if next_brs_day:
+            between = [d for d in all_trading_days if date_str < d < next_brs_day]
+            if len(between) == 1:
+                back_calc = True
+                print(f"  [INFO] {date_str} 与 {next_brs_day} BRS Daily 之间夹有交易日 {between[0]}，回算 SPOT-CHANGE")
+            elif len(between) > 1:
+                print(f"  [WARN] {date_str} 与 {next_brs_day} 之间有 {len(between)} 个交易日，BRS Daily 无法回算 —— BDI/BPI/BSI/BHSI 将留空")
+                next_brs = None  # 放弃 BRS Daily 来源
+
+        try:
+            parsed = parse_day(
+                str(day_folder),
+                extra_pdfs=[str(next_brs)] if next_brs else None,
+                skip_brs_daily_in_folder=True,
+                brs_back_calc=back_calc,
+            )
+        except Exception as e:
+            print(f"  [ERR] {date_str} 解析失败: {e}")
+            continue
+
+        # parsed["date"] 来自 Capesize Index PDF，应等于 date_str
+        if parsed.get("date") and parsed["date"] != date_str:
+            print(f"  [WARN] {date_str} 文件夹内 Capesize PDF 日期为 {parsed['date']}，按文件夹名修正")
+        parsed["date"] = date_str
+
+        if not args.force and date_str in existing:
+            print(f"  [SKIP] {date_str} 已在 CSV（--force 覆盖）")
+            skipped.append(date_str)
+        else:
+            append_row(parsed)
+            success_dates.append(date_str)
+
+        json_path = JSON_DIR / f"bdi_{date_str}.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(parsed, f, indent=2, ensure_ascii=False)
+        print(f"  [OK]  {date_str}  BDI={parsed.get('BDI')}  BCI={parsed.get('BCI')}  "
+              f"BPI={parsed.get('BPI')}  BSI={parsed.get('BSI')}  BHSI={parsed.get('BHSI')}")
+
+    print(f"\n[3/3] 完成。新增 {len(success_dates)} 行，跳过 {len(skipped)} 个已存在日期。")
     for d in success_dates:
-        print(f"        - {d}  →  {JSON_DIR / f'bdi_{d}.json'}")
+        print(f"        + {d}  →  {JSON_DIR / f'bdi_{d}.json'}")
+    for d in skipped:
+        print(f"        = {d}  (CSV 已存在)")
     print(f"\n      CSV: {CSV_PATH}")
 
 
