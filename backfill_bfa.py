@@ -11,15 +11,16 @@ Usage:
     source .venv/bin/activate
     SSL_CERT_FILE=$(python3 -m certifi) python3 backfill_bfa.py
 """
-import csv, email, imaplib, io, ssl
+import csv, email, imaplib, io, os, ssl
 from datetime import datetime
 from email.header import decode_header
 from pathlib import Path
 
-IMAP_HOST = "imap.qiye.aliyun.com"
-IMAP_PORT = 993
-IMAP_USER = "data@aquabridge.ai"
-IMAP_PWD  = "bZ4NqiA4k8WK6iIb"
+# 凭据优先读环境变量（GitHub Actions 用 Secret 注入），回退到本地默认值
+IMAP_HOST = os.getenv("IMAP_HOST", "imap.qiye.aliyun.com")
+IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
+IMAP_USER = os.getenv("IMAP_USER", "data@aquabridge.ai")
+IMAP_PWD  = os.getenv("IMAP_PWD",  "bZ4NqiA4k8WK6iIb")
 
 HERE     = Path(__file__).resolve().parent
 CSV_PATH = HERE / "baltic_exchange_index_history.csv"

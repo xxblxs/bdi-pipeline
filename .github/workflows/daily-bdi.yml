@@ -1,0 +1,48 @@
+name: Daily BDI fetch & sync
+
+on:
+  schedule:
+    - cron: '0 15 * * *'        # 北京时间每天 23:00 (UTC+8)
+  workflow_dispatch: {}          # 支持在 Actions 页手动触发
+
+permissions:
+  contents: write                # 允许把更新后的 CSV/JSON 提交回仓库
+
+concurrency:
+  group: daily-bdi
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: self-hosted         # 国内自建 runner（IMAP 登录走国内 IP）
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up venv & install deps
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt
+
+      - name: Fetch & parse BRS emails
+        env:
+          IMAP_PWD: ${{ secrets.IMAP_PWD }}
+        run: .venv/bin/python run_bdi.py --days 7
+
+      - name: Sync JSON to navgreen API
+        env:
+          SYNC_URL: ${{ secrets.SYNC_URL }}   # 可不设，未设则用代码默认地址
+        run: .venv/bin/python sync_bdi.py --last 3
+
+      - name: Commit updated data
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/json baltic_exchange_index_history.csv
+          if git diff --cached --quiet; then
+            echo "无数据变化，跳过提交"
+          else
+            git commit -m "chore: daily BDI update $(date -u +%F) [skip ci]"
+            git push
+          fi

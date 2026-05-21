@@ -21,6 +21,7 @@ import csv
 import email
 import imaplib
 import json
+import os
 import re
 import ssl
 from datetime import datetime, timedelta
@@ -31,10 +32,11 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # 配置（修改这里即可）
 # ---------------------------------------------------------------------------
-IMAP_HOST = "imap.qiye.aliyun.com"
-IMAP_PORT = 993
-IMAP_USER = "data@aquabridge.ai"
-IMAP_PWD  = "bZ4NqiA4k8WK6iIb"          # 三方客户端专用密码
+# 凭据优先读环境变量（GitHub Actions 用 Secret 注入），回退到本地默认值
+IMAP_HOST = os.getenv("IMAP_HOST", "imap.qiye.aliyun.com")
+IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
+IMAP_USER = os.getenv("IMAP_USER", "data@aquabridge.ai")
+IMAP_PWD  = os.getenv("IMAP_PWD",  "bZ4NqiA4k8WK6iIb")   # 三方客户端专用密码
 
 # 监听的发件人（BRS Brokers 同时使用 zhu.hao-sheng.p@ 和 research.asia@ 等多个邮箱，
 # 用域名做子串匹配可一次涵盖）
@@ -172,20 +174,46 @@ def ensure_csv():
             csv.writer(f).writerow(CSV_COLUMNS)
 
 
-def append_row(parsed: dict):
-    """Append parsed dict as one CSV row, in CSV_COLUMNS order."""
-    ensure_csv()
+def _build_row(parsed: dict, existing_id: str = "") -> list:
+    """Build one CSV row in CSV_COLUMNS order from a parsed dict."""
     row = []
     for col in CSV_COLUMNS:
         if col == "_id":
-            row.append("")  # 留给后端生成
+            row.append(existing_id)  # 保留后端已生成的 id（重写整行时不丢）
         elif col == "updated_at":
             row.append(parsed.get("updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         else:
             v = parsed.get(col, "")
             row.append("" if v is None else v)
-    with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(row)
+    return row
+
+
+def upsert_row(parsed: dict) -> bool:
+    """按 `date` upsert 一行：该日期已存在则就地替换整行，否则追加。
+
+    返回 True 表示替换了已有行，False 表示新增。这样重跑（含 BRS Daily
+    滞后字段补全）会更新原行，不再产生重复行。
+    """
+    ensure_csv()
+    with open(CSV_PATH, encoding="utf-8", newline="") as f:
+        rows = list(csv.reader(f))
+    header = rows[0]
+    date_idx = header.index("date")
+    id_idx = header.index("_id")
+    target_date = parsed.get("date", "")
+    replaced = False
+    for i in range(1, len(rows)):
+        r = rows[i]
+        if len(r) > date_idx and r[date_idx] == target_date:
+            existing_id = r[id_idx] if len(r) > id_idx else ""
+            rows[i] = _build_row(parsed, existing_id)
+            replaced = True
+            break
+    if not replaced:
+        rows.append(_build_row(parsed))
+    with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(rows)
+    return replaced
 
 
 def existing_csv_dates() -> set:
@@ -211,7 +239,7 @@ def main():
     ap.add_argument("--date",  type=str, default=None, help="只处理指定日期 YYYY-MM-DD")
     ap.add_argument("--start", type=str, default=None, help="区间起始 YYYY-MM-DD")
     ap.add_argument("--end",   type=str, default=None, help="区间结束 YYYY-MM-DD")
-    ap.add_argument("--force", action="store_true",   help="即使 CSV 已有该日期也重新写入")
+    ap.add_argument("--force", action="store_true",   help="（已废弃：现在总是按 date upsert）")
     args = ap.parse_args()
 
     # 计算时间区间
@@ -277,11 +305,10 @@ def main():
 
     sorted_brs_days = sorted(brs_daily_by_day.keys())
     all_trading_days = sorted(capesize_by_day.keys())  # 所有已下载到 Capesize PDF 的日子
-    existing = set() if args.force else existing_csv_dates()
 
     print(f"\n[3/3] 解析 {len(target_dates)} 个交易日并写入 …")
-    success_dates = []
-    skipped = []
+    added_dates = []
+    replaced_dates = []
     for date_str in target_dates:
         day_folder = ATTACH_DIR / date_str
         # 找下一个 BRS Daily（一般来说次个交易日的 Issue 才包含本日 close）
@@ -318,12 +345,11 @@ def main():
             print(f"  [WARN] {date_str} 文件夹内 Capesize PDF 日期为 {parsed['date']}，按文件夹名修正")
         parsed["date"] = date_str
 
-        if not args.force and date_str in existing:
-            print(f"  [SKIP] {date_str} 已在 CSV（--force 覆盖）")
-            skipped.append(date_str)
+        # 按 date upsert：重跑时更新原行（含 BRS Daily 滞后字段补全），不产生重复行
+        if upsert_row(parsed):
+            replaced_dates.append(date_str)
         else:
-            append_row(parsed)
-            success_dates.append(date_str)
+            added_dates.append(date_str)
 
         json_path = JSON_DIR / f"bdi_{date_str}.json"
         with open(json_path, "w", encoding="utf-8") as f:
@@ -331,11 +357,11 @@ def main():
         print(f"  [OK]  {date_str}  BDI={parsed.get('BDI')}  BCI={parsed.get('BCI')}  "
               f"BPI={parsed.get('BPI')}  BSI={parsed.get('BSI')}  BHSI={parsed.get('BHSI')}")
 
-    print(f"\n[3/3] 完成。新增 {len(success_dates)} 行，跳过 {len(skipped)} 个已存在日期。")
-    for d in success_dates:
+    print(f"\n[3/3] 完成。新增 {len(added_dates)} 行，更新 {len(replaced_dates)} 行。")
+    for d in added_dates:
         print(f"        + {d}  →  {JSON_DIR / f'bdi_{d}.json'}")
-    for d in skipped:
-        print(f"        = {d}  (CSV 已存在)")
+    for d in replaced_dates:
+        print(f"        ~ {d}  (CSV 行已更新)")
     print(f"\n      CSV: {CSV_PATH}")
 
 
