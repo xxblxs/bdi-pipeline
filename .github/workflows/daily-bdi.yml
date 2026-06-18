@@ -16,8 +16,53 @@ jobs:
   run:
     runs-on: self-hosted         # 国内自建 runner（IMAP 登录走国内 IP）
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout with retry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          repo_url="https://github.com/${GITHUB_REPOSITORY}.git"
+          branch="${GITHUB_REF_NAME:-main}"
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+
+          mkdir -p "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE"
+          git init
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --local gc.auto 0
+          git config --local http.version HTTP/1.1
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $auth"
+
+          if git remote get-url origin >/dev/null 2>&1; then
+            git remote set-url origin "$repo_url"
+          else
+            git remote add origin "$repo_url"
+          fi
+
+          for attempt in $(seq 1 8); do
+            echo "Fetch attempt ${attempt}/8 from ${repo_url}"
+            if git \
+              -c protocol.version=2 \
+              -c http.lowSpeedLimit=1000 \
+              -c http.lowSpeedTime=120 \
+              fetch --no-tags --prune --depth=1 origin "+refs/heads/${branch}:refs/remotes/origin/${branch}"; then
+              break
+            fi
+
+            if [ "$attempt" -eq 8 ]; then
+              echo "Fetch failed after ${attempt} attempts"
+              exit 1
+            fi
+
+            sleep_seconds=$((attempt * 45))
+            echo "Fetch failed; retrying in ${sleep_seconds}s"
+            sleep "$sleep_seconds"
+          done
+
+          git checkout --force -B "$branch" "refs/remotes/origin/${branch}"
+          git reset --hard "$GITHUB_SHA" || git reset --hard "refs/remotes/origin/${branch}"
+          git clean -ffdx
 
       - name: Set up venv & install deps
         run: |
@@ -46,3 +91,7 @@ jobs:
             git commit -m "chore: daily BDI update $(date -u +%F) [skip ci]"
             git push
           fi
+
+      - name: Cleanup git credentials
+        if: always()
+        run: git config --local --unset-all http.https://github.com/.extraheader || true
