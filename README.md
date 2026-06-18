@@ -90,6 +90,21 @@ python sync_bdi.py --last 5 --allow-incomplete   # 连未完成（BDI 为空）�
 才齐，当天会被跳过，次日重跑自动补推。接口按 `date` upsert，重复推送幂等、安全。
 接口地址可用环境变量 `SYNC_URL` 覆盖。
 
+### BDI/BCI/BPI/BSI/BHSI 快源
+
+`run_bdi.py` 默认会在写入 CSV/JSON 前，用公开快源覆盖 5 个 headline 指数：
+
+- 东方财富行业指数：`BDI`、`BCI`、`BPI`、`BSI`
+- StockQ：`BHSI`
+
+快源只在日期精确匹配时覆盖，避免补历史数据时误用最新值；采集失败时会保留邮箱/PDF 解析值。
+如需临时关闭：
+
+```bash
+python run_bdi.py --date 2026-05-21 --no-fast-indices
+FAST_BALTIC_INDICES=0 python run_bdi.py --days 7
+```
+
 ## 每日自动化（GitHub Actions）
 
 `.github/workflows/daily-bdi.yml` 每天北京时间 23:00 自动执行：
@@ -118,4 +133,3 @@ python sync_bdi.py --last 5 --allow-incomplete   # 连未完成（BDI 为空）�
 - **`imaplib.IMAP4.error: Login failed`** → 应用专用密码错或被禁用
 - **某些字段没解析出来** → Baltic Exchange 改了 PDF 模板，给 Claude 发新样本即可
 - **Actions 里 IMAP 登录失败/超时** → runner 不在国内或被风控，确认用的是国内 self-hosted runner
-

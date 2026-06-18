@@ -240,6 +240,8 @@ def main():
     ap.add_argument("--start", type=str, default=None, help="区间起始 YYYY-MM-DD")
     ap.add_argument("--end",   type=str, default=None, help="区间结束 YYYY-MM-DD")
     ap.add_argument("--force", action="store_true",   help="（已废弃：现在总是按 date upsert）")
+    ap.add_argument("--no-fast-indices", action="store_true",
+                    help="不使用东方财富/StockQ 快源覆盖 BDI/BCI/BPI/BSI/BHSI")
     args = ap.parse_args()
 
     # 计算时间区间
@@ -259,6 +261,11 @@ def main():
     JSON_DIR.mkdir(parents=True, exist_ok=True)
     ATTACH_DIR.mkdir(parents=True, exist_ok=True)
     from parse_bdi import parse_day
+    from fast_baltic_indices import FAST_CODES, fetch_fast_baltic_indices
+    use_fast_indices = (
+        not args.no_fast_indices
+        and os.getenv("FAST_BALTIC_INDICES", "1").lower() not in {"0", "false", "no", "off"}
+    )
 
     # 把搜索窗口往后扩 5 天，方便给最后一天的 BDI/BPI/... 找到「下一日 BRS Daily」
     fetch_end = end + timedelta(days=5)
@@ -344,6 +351,22 @@ def main():
         if parsed.get("date") and parsed["date"] != date_str:
             print(f"  [WARN] {date_str} 文件夹内 Capesize PDF 日期为 {parsed['date']}，按文件夹名修正")
         parsed["date"] = date_str
+
+        if use_fast_indices:
+            try:
+                fast_indices = fetch_fast_baltic_indices(date_str)
+            except Exception as e:
+                print(f"  [WARN] {date_str} 快源指数采集失败，保留邮箱/PDF值: {e}")
+            else:
+                if fast_indices:
+                    parsed.update(fast_indices)
+                    got = ", ".join(f"{code}={parsed.get(code)}" for code in FAST_CODES if code in fast_indices)
+                    missing = [code for code in FAST_CODES if code not in fast_indices]
+                    print(f"  [FAST] {date_str} 使用快源覆盖: {got}")
+                    if missing:
+                        print(f"  [FAST] {date_str} 快源未返回: {', '.join(missing)}")
+                else:
+                    print(f"  [FAST] {date_str} 快源没有精确匹配日期，保留邮箱/PDF值")
 
         # 按 date upsert：重跑时更新原行（含 BRS Daily 滞后字段补全），不产生重复行
         if upsert_row(parsed):
