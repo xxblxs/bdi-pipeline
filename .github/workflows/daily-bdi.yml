@@ -25,7 +25,10 @@ jobs:
           repo_url="https://github.com/${GITHUB_REPOSITORY}.git"
           branch="${GITHUB_REF_NAME:-main}"
           auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          home_dir="${RUNNER_TEMP:-/tmp}/github-home"
 
+          mkdir -p "$home_dir"
+          export HOME="$home_dir"
           mkdir -p "$GITHUB_WORKSPACE"
           cd "$GITHUB_WORKSPACE"
           git init
@@ -94,4 +97,6 @@ jobs:
 
       - name: Cleanup git credentials
         if: always()
-        run: git config --local --unset-all http.https://github.com/.extraheader || true
+        run: |
+          cd "$GITHUB_WORKSPACE" || exit 0
+          git config --local --unset-all http.https://github.com/.extraheader || true
