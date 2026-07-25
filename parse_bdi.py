@@ -14,12 +14,17 @@ parse_bdi.py
     print(result["date"], result["BDI"], result["BCI"])
 """
 import re
+import os
+import subprocess
+import sys
 import zipfile
 import tempfile
 import fnmatch
 from pathlib import Path
 import pdfplumber
 from datetime import datetime
+
+PDF_READ_TIMEOUT_SECONDS = int(os.getenv("PDF_READ_TIMEOUT_SECONDS", "90"))
 
 
 def _read_pdf_text(path: str) -> str:
@@ -28,6 +33,35 @@ def _read_pdf_text(path: str) -> str:
         for page in pdf.pages:
             out.append(page.extract_text() or "")
     return "\n".join(out)
+
+
+def _read_pdf_text_isolated(
+    path: str, timeout_seconds: int = PDF_READ_TIMEOUT_SECONDS
+) -> str:
+    """Extract PDF text in a disposable process with a hard timeout."""
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--extract-text", path],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"PDF text extraction exceeded {timeout_seconds}s"
+        ) from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip().splitlines()
+        suffix = f": {detail[-1]}" if detail else ""
+        raise RuntimeError(
+            f"PDF text extraction exited {completed.returncode}{suffix}"
+        )
+    return completed.stdout
 
 
 def _parse_date_official(text: str) -> str:
@@ -292,7 +326,7 @@ def parse_day(folder_or_zip: str, extra_pdfs: list = None,
     date_brs = None
     for pdf, parser, date_src in plan:
         try:
-            text = _read_pdf_text(str(pdf))
+            text = _read_pdf_text_isolated(str(pdf))
         except Exception as e:
             print(f"  [WARN] read failed {pdf.name}: {e}")
             continue
@@ -325,6 +359,10 @@ def parse_day(folder_or_zip: str, extra_pdfs: list = None,
 
 
 if __name__ == "__main__":
-    import sys, json
-    out = parse_day(sys.argv[1])
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+    if len(sys.argv) == 3 and sys.argv[1] == "--extract-text":
+        sys.stdout.write(_read_pdf_text(sys.argv[2]))
+    else:
+        import json
+
+        out = parse_day(sys.argv[1])
+        print(json.dumps(out, indent=2, ensure_ascii=False))
