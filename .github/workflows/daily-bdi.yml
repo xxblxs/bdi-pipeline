@@ -82,7 +82,7 @@ jobs:
       - name: Sync JSON to navgreen API
         env:
           SYNC_URL: ${{ secrets.SYNC_URL }}   # 可不设，未设则用代码默认地址
-        run: .venv/bin/python sync_bdi.py --last 3
+        run: .venv/bin/python sync_bdi.py --last 7
 
       - name: Commit updated data
         run: |
