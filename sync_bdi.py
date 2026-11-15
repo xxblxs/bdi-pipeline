@@ -2,7 +2,7 @@
 """
 sync_bdi.py — 把解析好的 BDI JSON 同步到 navgreen API
 
-接口（与提供的 curl 完全一致，无鉴权）：
+接口（通过 SYNC_TOKEN 环境变量提供 token 请求头）：
     POST https://miniapi.navgreen.cn/api/data/baltic_exchange_index/sync
 请求体即 output/json/bdi_<date>.json 的原样内容（字段逐一对应，无需映射）。
 
@@ -12,7 +12,7 @@ sync_bdi.py — 把解析好的 BDI JSON 同步到 navgreen API
     python sync_bdi.py --all                        # 同步全部 JSON
     python sync_bdi.py --last 5 --allow-incomplete  # 连未完成（BDI 为空）的也推
 
-接口地址可用环境变量 SYNC_URL 覆盖。
+接口地址可用环境变量 SYNC_URL 覆盖。HTTP 和业务 code 均成功才算同步成功。
 """
 import argparse
 import json
@@ -28,6 +28,7 @@ JSON_DIR = HERE / "output" / "json"
 # 用 `or` 兜底：GitHub Actions 把未设置的 secret 展开成空串，空串需回退到默认值
 SYNC_URL = os.getenv("SYNC_URL") or \
     "https://miniapi.navgreen.cn/api/data/baltic_exchange_index/sync"
+SYNC_TOKEN = (os.getenv("SYNC_TOKEN") or "").strip()
 
 JSON_RE = re.compile(r"^bdi_(\d{4}-\d{2}-\d{2})\.json$")
 
@@ -50,20 +51,35 @@ def is_complete(payload: dict) -> bool:
 
 
 def post_one(date_str: str, payload: dict) -> bool:
+    if not SYNC_TOKEN:
+        print(f"  [ERR]  {date_str}  缺少 SYNC_TOKEN，请配置有同步权限的有效 token")
+        return False
     try:
         resp = requests.post(
             SYNC_URL,
             headers={"accept": "application/json",
-                     "Content-Type": "application/json"},
+                     "Content-Type": "application/json",
+                     "token": SYNC_TOKEN},
             json=payload,
             timeout=30,
+            allow_redirects=False,
         )
     except requests.RequestException as e:
-        print(f"  [ERR]  {date_str}  请求异常: {e}")
+        print(f"  [ERR]  {date_str}  请求异常: {type(e).__name__}")
         return False
-    ok = 200 <= resp.status_code < 300
+
+    try:
+        body = resp.json()
+    except ValueError:
+        print(f"  [ERR]  {date_str}  HTTP {resp.status_code}  接口未返回有效 JSON")
+        return False
+    code = body.get("code") if isinstance(body, dict) else None
+    message = str(body.get("msg") or body.get("message") or "") if isinstance(body, dict) else ""
+    # 业务错误同样可能返回 HTTP 200；不能将 token 过期或权限不足计为成功。
+    ok = 200 <= resp.status_code < 300 and code == 200
     tag = "OK " if ok else "ERR"
-    print(f"  [{tag}] {date_str}  HTTP {resp.status_code}  {resp.text[:200]}")
+    message = message.replace(SYNC_TOKEN, "[REDACTED]")[:200]
+    print(f"  [{tag}] {date_str}  HTTP {resp.status_code}  code={code}  {message}")
     return ok
 
 
@@ -76,6 +92,10 @@ def main():
     ap.add_argument("--allow-incomplete", action="store_true",
                     help="连 BDI 为空的未完成记录也推送")
     args = ap.parse_args()
+
+    if not SYNC_TOKEN:
+        print("[sync] 缺少 SYNC_TOKEN，请在环境变量或 GitHub Actions Secrets 中配置有效 token")
+        sys.exit(1)
 
     files = list_json_files()
     if not files:
@@ -98,7 +118,8 @@ def main():
 
     posted, skipped, failed = [], [], []
     for date_str, path in selected:
-        payload = json.load(open(path, encoding="utf-8"))
+        with path.open(encoding="utf-8") as source:
+            payload = json.load(source)
         if not args.allow_incomplete and not is_complete(payload):
             print(f"  [SKIP] {date_str}  BDI 未到齐（滞后未完成）—— 次日重跑会自动补推")
             skipped.append(date_str)

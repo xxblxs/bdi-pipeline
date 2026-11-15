@@ -73,7 +73,11 @@ jobs:
           .venv/bin/pip install --upgrade pip
           .venv/bin/pip install -r requirements.txt
 
+      - name: Run regression tests
+        run: .venv/bin/python -m unittest discover -s tests -v
+
       - name: Fetch & parse BRS emails
+        id: fetch
         timeout-minutes: 35
         env:
           IMAP_PWD: ${{ secrets.IMAP_PWD }}
@@ -82,9 +86,11 @@ jobs:
       - name: Sync JSON to navgreen API
         env:
           SYNC_URL: ${{ secrets.SYNC_URL }}   # 可不设，未设则用代码默认地址
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: .venv/bin/python sync_bdi.py --last 7
 
       - name: Commit updated data
+        if: ${{ !cancelled() && steps.fetch.outcome == 'success' }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

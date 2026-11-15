@@ -88,7 +88,11 @@ python sync_bdi.py --last 5 --allow-incomplete   # 连未完成（BDI 为空）�
 
 默认只推送 `BDI` 已到齐的「完整」记录 —— 最近一交易日的干散指数要等次日 BRS Daily
 才齐，当天会被跳过，次日重跑自动补推。接口按 `date` upsert，重复推送幂等、安全。
-接口地址可用环境变量 `SYNC_URL` 覆盖。
+接口地址可用环境变量 `SYNC_URL` 覆盖。同步需要通过环境变量 `SYNC_TOKEN` 提供有同步权限的有效
+token（包含接口要求的完整前缀），请求会将其放入 `token` 头。不要将凭据写入代码、JSON 或 Git。
+`SYNC_TOKEN` 缺失、接口返回非 2xx、响应不是有效 JSON，或业务 `code` 不为 `200` 时，
+脚本以非零状态退出，Actions 会显示失败。`HTTP 200` 中的 `code:4002` 代表鉴权失败，
+需要更新凭据后重跑；过期 token 不会自动续期。
 
 ### BDI/BCI/BPI/BSI/BHSI 快源
 
@@ -117,6 +121,7 @@ FAST_BALTIC_INDICES=0 python run_bdi.py --days 7
 2. 配置 Secrets（仓库 Settings → Secrets and variables → Actions）：
    - `IMAP_PWD` — 阿里云三方客户端专用密码（必需）
    - `SYNC_URL` — 同步接口地址（可选，不设则用代码默认值）
+   - `SYNC_TOKEN` — 后端授权用于指数同步的有效 token（必需，过期后需更新）
 3. **接入自建 runner**：阿里云邮箱对境外 IP 的 IMAP 登录会风控，GitHub 托管 runner
    多在境外，故必须用国内常开机器做 self-hosted runner。
    在该机器上：仓库 Settings → Actions → Runners → New self-hosted runner，
@@ -126,6 +131,8 @@ FAST_BALTIC_INDICES=0 python run_bdi.py --days 7
 
 凭据通过环境变量 `IMAP_PWD` / `IMAP_USER` / `IMAP_HOST` / `IMAP_PORT` 注入，
 未设置时回退到 `run_bdi.py` 内的默认值（方便本地直接运行）。
+
+同步失败时，成功抓取的 CSV/JSON 仍会提交保存，工作流保留失败状态，修复凭据后可重跑补推。
 
 ## 故障排查
 
